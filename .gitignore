@@ -3,3 +3,6 @@
 *.pyd
 __py
 **/__pycache__/
+weight/ObjectAwareModel.pt
+weight/ObjectAwareModel.tar.gz
+*.jpg
