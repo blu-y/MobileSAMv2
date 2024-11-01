@@ -6,7 +6,8 @@
 #   Swin: (https://github.com/microsoft/swin-transformer)
 # Build the TinyViT Model
 # --------------------------------------------------------
-
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 import itertools
 import torch
 import torch.nn as nn

@@ -1,14 +1,10 @@
 import argparse
-import ast
 import torch
-from PIL import Image
 import cv2
 import os
-import sys
 from mobilesamv2.promt_mobilesamv2 import ObjectAwareModel
 from mobilesamv2 import sam_model_registry, SamPredictor
 from typing import Any, Dict, Generator,List
-import matplotlib.pyplot as plt
 import numpy as np
 
 # check if ObjectAwareModel.tar.gz exists
@@ -23,14 +19,16 @@ def parse_args():
     parser.add_argument("--ObjectAwareModel_path", type=str, default='./PromptGuidedDecoder/ObjectAwareModel.pt', help="ObjectAwareModel path")
     parser.add_argument("--Prompt_guided_Mask_Decoder_path", type=str, default='./PromptGuidedDecoder/Prompt_guided_Mask_Decoder.pt', help="Prompt_guided_Mask_Decoder path")
     parser.add_argument("--encoder_path", type=str, default="./", help="select your own path")
-    parser.add_argument("--img_path", type=str, default="./test_images/", help="path to image file")
-    parser.add_argument("--imgsz", type=int, default=1024, help="image size")
-    parser.add_argument("--iou",type=float,default=0.9,help="yolo iou")
-    parser.add_argument("--conf", type=float, default=0.4, help="yolo object confidence threshold")
+    parser.add_argument("--img_path", type=str, default="./test_images/17.png", help="path to image file or directory")
+    parser.add_argument("--imgsz", type=int, default=256, help="image size")
+    parser.add_argument("--iou",type=float,default=0.7,help="yolo iou")
+    parser.add_argument("--conf", type=float, default=0.6, help="yolo object confidence threshold")
     parser.add_argument("--retina",type=bool,default=True,help="draw segmentation masks",)
-    parser.add_argument("--output_dir", type=str, default="./", help="image save path")
+    parser.add_argument("--output_dir", type=str, default="./result/segment/", help="image save path")
     parser.add_argument("--encoder_type", type=str, default="tiny_vit", choices=['tiny_vit','sam_vit_h','mobile_sam','efficientvit_l2','efficientvit_l1','efficientvit_l0'], help="choose the model type")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     return parser.parse_args()
+
 def create_model():
     Prompt_guided_path='./PromptGuidedDecoder/Prompt_guided_Mask_Decoder.pt'
     obj_model_path='./weight/ObjectAwareModel.pt'
@@ -40,20 +38,23 @@ def create_model():
     mobilesamv2.prompt_encoder=PromptGuidedDecoder['PromtEncoder']
     mobilesamv2.mask_decoder=PromptGuidedDecoder['MaskDecoder']
     return mobilesamv2,ObjAwareModel
-    
-def show_anns(anns):
+
+def show_anns(anns, image):
     if len(anns) == 0:
-        return
-    ax = plt.gca()
-    ax.set_autoscale_on(False)
+        return image
     img = np.ones((anns.shape[1], anns.shape[2], 4))
     img[:,:,3] = 0
     for ann in range(anns.shape[0]):
         m = anns[ann].bool()
-        m=m.cpu().numpy()
+        m = m.cpu().numpy()
         color_mask = np.concatenate([np.random.random(3), [1]])
         img[m] = color_mask
-    ax.imshow(img)
+    return img
+
+def generate_image_with_annotations(image, anns):
+    background = np.ones_like(image) * 255
+    annotated_image = show_anns(anns, background)
+    return annotated_image
 
 def batch_iterator(batch_size: int, *args) -> Generator[List[Any], None, None]:
     assert len(args) > 0 and all(
@@ -77,9 +78,14 @@ def main(args):
     mobilesamv2.to(device=device)
     mobilesamv2.eval()
     predictor = SamPredictor(mobilesamv2)
-    image_files= os.listdir(args.img_path)
+    if os.path.isdir(args.img_path):
+        image_files= os.listdir(args.img_path)
+    elif os.path.isfile(args.img_path):
+        image_files=[os.path.basename(args.img_path)]
+        args.img_path=os.path.dirname(args.img_path)+"/"
     for image_name in image_files:
-        print(image_name)
+        # print(image_name)
+        print(args.img_path + image_name)
         image = cv2.imread(args.img_path + image_name)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         obj_results = ObjAwareModel(image,device=device,retina_masks=args.retina,imgsz=args.imgsz,conf=args.conf,iou=args.iou)
@@ -90,10 +96,12 @@ def main(args):
         input_boxes = torch.from_numpy(input_boxes).cuda()
         sam_mask=[]
         image_embedding=predictor.features
-        image_embedding=torch.repeat_interleave(image_embedding, 320, dim=0)
+        image_embedding=torch.repeat_interleave(image_embedding, args.batch_size, dim=0)
         prompt_embedding=mobilesamv2.prompt_encoder.get_dense_pe()
-        prompt_embedding=torch.repeat_interleave(prompt_embedding, 320, dim=0)
-        for (boxes,) in batch_iterator(320, input_boxes):
+        prompt_embedding=torch.repeat_interleave(prompt_embedding, args.batch_size, dim=0)
+        for (boxes,) in batch_iterator(args.batch_size, input_boxes):
+            # print("batch")
+            torch.cuda.empty_cache() 
             with torch.no_grad():
                 image_embedding=image_embedding[0:boxes.shape[0],:,:,:]
                 prompt_embedding=prompt_embedding[0:boxes.shape[0],:,:,:]
@@ -110,20 +118,25 @@ def main(args):
                     simple_type=True,
                 )
                 low_res_masks=predictor.model.postprocess_masks(low_res_masks, predictor.input_size, predictor.original_size)
-                sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold)*1.0
+                # sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold)*1.0
+                # print(mobilesamv2.mask_threshold)
+                sam_mask_pre = (low_res_masks > 0.2)*1.0
                 sam_mask.append(sam_mask_pre.squeeze(1))
         sam_mask=torch.cat(sam_mask)
         annotation = sam_mask
         areas = torch.sum(annotation, dim=(1, 2))
         sorted_indices = torch.argsort(areas, descending=True)
         show_img = annotation[sorted_indices]
-        plt.figure(figsize=(20,20))
-        background=np.ones_like(image)*255
-        plt.imshow(background)
-        show_anns(show_img)
-        plt.axis('off')
-        plt.show() 
-        plt.savefig("{}".format(output_dir+image_name), bbox_inches='tight', pad_inches = 0.0) 
+        # plt.figure(figsize=(10,10))
+        annotated_image = generate_image_with_annotations(image, show_img)
+        # print(annotated_image.shape)
+        # plt.imshow(annotated_image)
+        # plt.axis('off') 
+        output_name = image_name.split(".")[0] + ".png"
+        output_image = annotated_image * 255
+        output_image = output_image[:,:,:3].astype(np.uint8)
+        if not os.path.exists(output_dir): os.makedirs(output_dir)
+        cv2.imwrite(output_dir + output_name, cv2.cvtColor(output_image, cv2.COLOR_RGB2BGR))
 
 if __name__ == "__main__":
     args = parse_args()
